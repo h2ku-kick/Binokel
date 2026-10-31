@@ -337,12 +337,12 @@ export class TableView {
     const spacing = n > 1 ? Math.min(g.cw * 0.6, (g.W - 16 - g.cw) / (n - 1)) : 0;
     const total = spacing * (n - 1) + g.cw;
     const x0 = (g.W - total) / 2 + g.cw / 2;
-    const baseY = g.H - g.ch / 2 - 12;
+    const baseY = g.H - g.ch / 2 - 24;
     const newCount = hand.filter((c) => !this.cardEls.has(c.id)).length;
     hand.forEach((c, i) => {
       const mid = (n - 1) / 2;
       const off = i - mid;
-      let y = baseY + off * off * 0.7;
+      let y = baseY + (mid > 0 ? (off * off) / (mid * mid) : 0) * Math.min(14, g.ch * 0.12);
       let cls = '';
       if (myTurnPlay) {
         if (legal.has(c.id)) cls = 'playable';
@@ -364,7 +364,7 @@ export class TableView {
         card: c,
         x: x0 + i * spacing,
         y,
-        rot: off * 1.4,
+        rot: mid > 0 ? (off / mid) * Math.min(9, mid * 1.4) : 0,
         z: 100 + i,
         cls,
         from: { x: g.cx, y: g.cy },

@@ -86,6 +86,7 @@ input {
 
 .screen.game {
   padding: 0;
+  overflow: hidden;
   background: var(--bg);
 }
 
