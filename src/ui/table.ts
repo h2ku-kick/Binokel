@@ -3,7 +3,7 @@ import { findMelds, meldTotal } from '../engine/melds';
 import { GameState, legalFor, minNextBid, partyCount, partyOf, partySeats } from '../engine/game';
 import { winningIndex } from '../engine/rules';
 import { GameConn } from '../controller/host';
-import { CARD_BACK_HTML, cardFaceHtml, miniCardHtml, suitSvg } from './cardsvg';
+import { cardBackHtml, cardFaceHtml, miniCardHtml, suitSvg } from './cardsvg';
 import { callPhrase, losePhrase, madePhrase, trumpPhrase, winPhrase } from './phrases';
 import { esc } from './util';
 
@@ -136,9 +136,12 @@ export class TableView {
   private geo() {
     const W = this.el.clientWidth;
     const H = this.el.clientHeight;
-    const cw = Math.round(Math.max(50, Math.min(104, W / 6, H / 6.4)));
-    const ch = Math.round(cw * 1.5);
-    return { W, H, cw, ch, cx: W / 2, cy: H * 0.43 };
+    const land = W > H * 1.15;
+    const cw = land
+      ? Math.round(Math.max(46, Math.min(112, H * 0.2, W / 9.5)))
+      : Math.round(Math.max(50, Math.min(104, W / 6, H / 6.4)));
+    const ch = Math.round(cw * 1.55);
+    return { W, H, cw, ch, cx: W / 2, cy: land ? H * 0.37 : H * 0.43, land };
   }
 
   private seatAnchor(rel: number): { x: number; y: number } {
@@ -158,13 +161,16 @@ export class TableView {
     const n = this.v!.mode;
     let dx = 0;
     let dy = 0;
-    if (rel === 0) dy = ch * 0.3;
+    const land = this.geo().land;
+    const sx = land ? 1.25 : 1;
+    const sy = land ? 0.75 : 1;
+    if (rel === 0) dy = ch * 0.3 * sy;
     else if (n === 3) {
-      dx = rel === 1 ? -cw * 0.55 : cw * 0.55;
-      dy = -ch * 0.14;
-    } else if (rel === 1) dx = -cw * 0.62;
-    else if (rel === 2) dy = -ch * 0.3;
-    else dx = cw * 0.62;
+      dx = (rel === 1 ? -cw * 0.55 : cw * 0.55) * sx;
+      dy = -ch * 0.14 * sy;
+    } else if (rel === 1) dx = -cw * 0.62 * sx;
+    else if (rel === 2) dy = -ch * 0.3 * sy;
+    else dx = cw * 0.62 * sx;
     const rot = ((hash(String(idx) + rel) % 9) - 4) * 1.6;
     return { x: cx + dx, y: cy + dy, rot };
   }
@@ -179,6 +185,7 @@ export class TableView {
     const g = this.geo();
     this.el.style.setProperty('--cw', g.cw + 'px');
     this.el.style.setProperty('--ch', g.ch + 'px');
+    this.el.classList.toggle('land', g.land);
     this.renderHud();
     this.renderCards();
     if (changed || true) {
@@ -205,7 +212,7 @@ export class TableView {
         p.kind === 'bot' && this.opts.online ? '<span class="badge dim">Bot</span>' : '',
       ].join('');
       const count = v.handCounts[seat];
-      const backs = Math.min(count, 6);
+      const fan = Array.from({ length: count }, (_, i) => `<i style="--i:${i};--m:${(count - 1) / 2}"></i>`).join('');
       seatsHtml.push(`
         <div class="seat pos-${n}-${rel} ${active ? 'active' : ''}" data-rel="${rel}">
           <div class="avatar" style="--hue:${(hash(p.name) % 360 + 360) % 360}">
@@ -215,7 +222,7 @@ export class TableView {
           <div class="seat-info">
             <div class="seat-name">${esc(p.name)}</div>
             <div class="seat-badges">${badges}</div>
-            <div class="seat-cards">${'<i class="mini-back"></i>'.repeat(backs)}<b>${count}</b>
+            <div class="seat-cards"><span class="fan" style="--n:${count}">${fan}</span><b>${count}</b>
               ${v.phase === 'playing' || v.phase === 'roundEnd' ? `<span class="tricks">· ${v.tricksCount[seat]} Stich${v.tricksCount[seat] === 1 ? '' : 'e'}</span>` : ''}</div>
           </div>
           ${bubble}
@@ -334,7 +341,7 @@ export class TableView {
 
     // Eigene Hand
     const n = hand.length;
-    const spacing = n > 1 ? Math.min(g.cw * 0.6, (g.W - 16 - g.cw) / (n - 1)) : 0;
+    const spacing = n > 1 ? Math.min(g.cw * (g.land ? 0.68 : 0.6), (Math.min(g.W, g.land ? g.W * 0.82 : g.W) - 16 - g.cw) / (n - 1)) : 0;
     const total = spacing * (n - 1) + g.cw;
     const x0 = (g.W - total) / 2 + g.cw / 2;
     const baseY = g.H - g.ch / 2 - 24;
@@ -413,6 +420,7 @@ export class TableView {
         y: pos.y,
         rot: pos.rot,
         z: 50 + i,
+        scale: g.land ? 0.86 : 1,
         cls: v.trickWinner >= 0 && v.trick[winningIndex(v.trick, v.trump!)].card.id === p.card.id ? 'winner' : '',
         from: this.seatAnchor(rel),
       });
@@ -444,7 +452,7 @@ export class TableView {
       if (!el) {
         el = document.createElement('div');
         el.className = 'card';
-        el.innerHTML = t.card ? cardFaceHtml(t.card) : CARD_BACK_HTML;
+        el.innerHTML = t.card ? cardFaceHtml(t.card) : cardBackHtml();
         el.dataset.face = t.card ? '1' : '0';
         const from = t.from ?? { x: t.x, y: t.y };
         el.style.transition = 'none';
@@ -645,7 +653,7 @@ export class TableView {
       <div class="modal">
         <div class="modal-title">${v.trump ? suitSvg(v.trump, 'tiny') : ''} ${esc(trumpPhrase(v.trump!))}</div>
         <div class="modal-sub">Gemeldet wird – Meldunga zähla nur mit mindeschtens oim Stich.</div>
-        ${rows.join('')}
+        <div class="modal-melds">${rows.join('')}</div>
         ${actions}
       </div>`;
   }
