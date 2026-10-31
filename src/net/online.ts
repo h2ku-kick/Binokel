@@ -1,10 +1,29 @@
-import Peer, { DataConnection } from 'peerjs';
+import mqtt, { MqttClient } from 'mqtt';
 import { Action, GameState, Level, PlayerInfo } from '../engine/game';
 import { GameConn, HostController } from '../controller/host';
 import { BOT_NAMES } from '../ui/phrases';
 
-const PREFIX = 'binokel-schwaebisch-';
+/*
+ * Online-Modus über einen öffentlichen MQTT-Server (WebSocket).
+ * Alle Nachrichten laufen über den Server – das funktioniert in jedem Netz
+ * (Mobilfunk, WLAN), und wer kurz die App verlässt, kommt automatisch wieder rein.
+ *
+ * Themen:  binokel-sw/v2/<CODE>/lobby        (Gastgeber → alle, retained)
+ *          binokel-sw/v2/<CODE>/up           (Gäste → Gastgeber)
+ *          binokel-sw/v2/<CODE>/to/<clientId> (Gastgeber → ein Gast)
+ */
+
+const DEFAULT_BROKERS = ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
+const ROOT = 'binokel-sw/v2/';
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const PING_MS = 4000;
+const GUEST_TIMEOUT_MS = 15000;
+
+function brokers(): string[] {
+  // Für Tests: ?broker=ws://localhost:8888
+  const b = new URLSearchParams(location.search).get('broker');
+  return b ? [b] : DEFAULT_BROKERS;
+}
 
 export function makeCode(): string {
   let s = '';
@@ -12,138 +31,226 @@ export function makeCode(): string {
   return s;
 }
 
+function randomId(): string {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+}
+
+/** Dauerhafte Geräte-ID, damit man nach einem Abbruch wieder auf seinen Platz kommt. */
+function clientId(): string {
+  try {
+    let id = localStorage.getItem('binokel-client-id');
+    if (!id) {
+      id = randomId();
+      localStorage.setItem('binokel-client-id', id);
+    }
+    return id;
+  } catch {
+    return randomId();
+  }
+}
+
 export interface LobbyInfo {
   code: string;
   mode: 3 | 4;
   players: { name: string; seat: number; connected: boolean }[];
+  started: boolean;
+  closed?: boolean;
 }
 
-type Msg =
-  | { t: 'hello'; name: string }
-  | { t: 'lobby'; lobby: LobbyInfo }
+type Up =
+  | { t: 'hello'; id: string; name: string }
+  | { t: 'ping'; id: string; name: string }
+  | { t: 'action'; id: string; a: Action }
+  | { t: 'bye'; id: string };
+
+type Down =
   | { t: 'start'; seat: number }
   | { t: 'view'; view: GameState }
-  | { t: 'action'; a: Action }
   | { t: 'error'; msg: string }
   | { t: 'full' }
-  | { t: 'closed' };
+  | { t: 'pong' };
 
-function friendlyError(e: unknown): string {
-  const type = (e as { type?: string })?.type;
-  if (type === 'peer-unavailable') return 'Tisch nicht gefunden. Stimmt der Code?';
-  if (type === 'unavailable-id') return 'Code schon vergeben, bitte nochmal versuchen.';
-  if (type === 'network' || type === 'server-error' || type === 'socket-error')
-    return 'Keine Verbindung zum Vermittlungsserver. Internet prüfen.';
-  if (type === 'browser-incompatible') return 'Dieser Browser unterstützt kein Online-Spiel.';
-  return 'Verbindungsfehler' + (type ? ` (${type})` : '');
+/** Verbindet sich mit dem ersten erreichbaren Server. */
+function connectTo(url: string, timeoutMs = 7000): Promise<MqttClient> {
+  return new Promise((resolve, reject) => {
+    const client = mqtt.connect(url, {
+      clientId: 'binokel_' + randomId(),
+      keepalive: 30,
+      reconnectPeriod: 1500,
+      connectTimeout: timeoutMs,
+      clean: true,
+    });
+    const timer = setTimeout(() => {
+      client.end(true);
+      reject(new Error('timeout'));
+    }, timeoutMs);
+    client.once('connect', () => {
+      clearTimeout(timer);
+      resolve(client);
+    });
+  });
+}
+
+function watchVisibility(client: MqttClient, onVisible?: () => void): () => void {
+  const handler = () => {
+    if (document.visibilityState !== 'visible') return;
+    if (!client.connected && !client.disconnecting) client.reconnect();
+    onVisible?.();
+  };
+  document.addEventListener('visibilitychange', handler);
+  window.addEventListener('online', handler);
+  return () => {
+    document.removeEventListener('visibilitychange', handler);
+    window.removeEventListener('online', handler);
+  };
+}
+
+const enc = (o: unknown) => JSON.stringify(o);
+function dec<T>(buf: Uint8Array | string): T | null {
+  try {
+    const s = typeof buf === 'string' ? buf : new TextDecoder().decode(buf);
+    return s ? (JSON.parse(s) as T) : null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Gastgeber
 // ---------------------------------------------------------------------------
 
+interface Guest {
+  id: string;
+  name: string;
+  seat: number;
+  lastSeen: number;
+  connected: boolean;
+}
+
 export class OnlineHost {
   code = makeCode();
   mode: 3 | 4 = 3;
   level: Level = 'normal';
-  private peer: Peer | null = null;
-  private guests: { conn: DataConnection; name: string; seat: number }[] = [];
+  private client: MqttClient | null = null;
+  private guests: Guest[] = [];
   host: HostController | null = null;
+  private lastViews = new Map<number, GameState>();
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private unwatch: (() => void) | null = null;
   onLobby: (l: LobbyInfo) => void = () => {};
   onError: (msg: string) => void = () => {};
   onToast: (msg: string) => void = () => {};
 
   constructor(private hostName: string) {}
 
-  open(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const peer = new Peer(PREFIX + this.code);
-      this.peer = peer;
-      let opened = false;
-      peer.on('open', () => {
-        opened = true;
-        resolve();
-        this.emitLobby();
-      });
-      peer.on('error', (e) => {
-        const msg = friendlyError(e);
-        if (!opened) reject(new Error(msg));
-        else this.onError(msg);
-      });
-      peer.on('disconnected', () => {
-        if (!this.peer?.destroyed) this.peer?.reconnect();
-      });
-      peer.on('connection', (conn) => this.handleConn(conn));
-    });
+  private topic(s: string) {
+    return ROOT + this.code + '/' + s;
   }
 
-  private handleConn(conn: DataConnection) {
-    conn.on('data', (raw) => {
-      const msg = raw as Msg;
-      if (msg.t === 'hello') this.handleHello(conn, msg.name);
-      else if (msg.t === 'action') {
-        const g = this.guests.find((x) => x.conn === conn);
-        if (g && this.host) this.host.act(g.seat, msg.a);
+  async open(): Promise<void> {
+    let lastErr: unknown = null;
+    for (const url of brokers()) {
+      try {
+        this.client = await connectTo(url);
+        break;
+      } catch (e) {
+        lastErr = e;
       }
+    }
+    if (!this.client) {
+      console.warn(lastErr);
+      throw new Error('Keine Verbindung zum Spielserver. Bitte Internet prüfen.');
+    }
+    const c = this.client;
+    c.on('message', (_t, payload) => {
+      const m = dec<Up>(payload);
+      if (m) this.handle(m);
     });
-    conn.on('close', () => this.handleClose(conn));
-    conn.on('error', () => this.handleClose(conn));
+    c.on('connect', () => {
+      // nach Wiederverbindung: Lobby erneut veröffentlichen
+      this.publishLobby();
+    });
+    await c.subscribeAsync(this.topic('up'), { qos: 1 });
+    this.publishLobby();
+    this.timer = setInterval(() => this.checkGuests(), 2000);
+    this.unwatch = watchVisibility(c);
   }
 
-  private handleHello(conn: DataConnection, rawName: string) {
-    const name = (rawName || 'Gast').slice(0, 16);
-    if (this.host) {
-      // Wiedereinstieg: Platz mit gleichem Namen, der gerade vom Bot gespielt wird
-      const s = this.host.state;
-      const seat = s.players.findIndex(
-        (p, i) => i !== 0 && p.name === name && p.kind === 'bot' && !this.guests.some((g) => g.seat === i && g.conn.open),
-      );
-      const wasGuest = seat >= 0 && this.guestSeats.has(seat);
-      if (!wasGuest) {
-        conn.send({ t: 'full' } satisfies Msg);
-        setTimeout(() => conn.close(), 500);
+  private send(id: string, m: Down) {
+    this.client?.publish(this.topic('to/' + id), enc(m), { qos: 1 });
+  }
+
+  private handle(m: Up) {
+    const now = Date.now();
+    let g = this.guests.find((x) => x.id === m.id);
+    // Ein Ping von einem Unbekannten zählt als Anmeldung (falls das Hallo verloren ging)
+    if (m.t === 'hello' || (m.t === 'ping' && !g)) {
+      const name = (m.name || 'Gast').slice(0, 16);
+      if (g) {
+        g.name = this.host ? g.name : name;
+        g.lastSeen = now;
+        this.markConnected(g);
+        if (this.host && g.seat > 0) {
+          this.send(g.id, { t: 'start', seat: g.seat });
+          const v = this.lastViews.get(g.seat);
+          if (v) this.send(g.id, { t: 'view', view: v });
+        }
+        this.publishLobby();
         return;
       }
-      this.guests = this.guests.filter((g) => g.seat !== seat);
-      this.guests.push({ conn, name, seat });
-      conn.send({ t: 'start', seat } satisfies Msg);
-      this.attachGuest(conn, seat);
-      this.host.setKind(seat, 'remote');
-      this.onToast(`${name} isch wieder do.`);
+      if (this.host || this.guests.length >= this.mode - 1) {
+        this.send(m.id, { t: 'full' });
+        return;
+      }
+      g = { id: m.id, name, seat: -1, lastSeen: now, connected: true };
+      this.guests.push(g);
+      this.reseat();
+      this.onToast(`${name} sitzt am Tisch.`);
+      this.publishLobby();
       return;
     }
-    if (this.guests.length >= this.mode - 1) {
-      conn.send({ t: 'full' } satisfies Msg);
-      setTimeout(() => conn.close(), 500);
-      return;
+    if (!g) return;
+    g.lastSeen = now;
+    if (!g.connected) this.markConnected(g);
+    if (m.t === 'ping') this.send(g.id, { t: 'pong' });
+    else if (m.t === 'action' && this.host && g.seat > 0) this.host.act(g.seat, m.a);
+    else if (m.t === 'bye') {
+      g.lastSeen = 0;
+      this.checkGuests();
     }
-    this.guests.push({ conn, name, seat: -1 });
-    this.reseat();
-    this.onToast(`${name} sitzt am Tisch.`);
-    this.emitLobby();
   }
 
-  private guestSeats = new Set<number>();
-
-  private handleClose(conn: DataConnection) {
-    const g = this.guests.find((x) => x.conn === conn);
-    if (!g) return;
-    if (this.host) {
-      if (this.host.state.players[g.seat].kind === 'remote') {
-        this.host.removeListener(g.seat);
-        this.host.setKind(g.seat, 'bot');
-        this.onToast(`${g.name} hot d'Verbindung verlore – a Bot spielt weiter.`);
-      }
-    } else {
-      this.guests = this.guests.filter((x) => x !== g);
-      this.reseat();
-      this.onToast(`${g.name} isch gange.`);
-      this.emitLobby();
+  private markConnected(g: Guest) {
+    const was = g.connected;
+    g.connected = true;
+    if (this.host && g.seat > 0 && this.host.state.players[g.seat].kind === 'bot') {
+      this.host.setKind(g.seat, 'remote');
+      if (!was) this.onToast(`${g.name} isch wieder do.`);
     }
+  }
+
+  private checkGuests() {
+    const now = Date.now();
+    let changed = false;
+    for (const g of [...this.guests]) {
+      if (!g.connected || now - g.lastSeen < GUEST_TIMEOUT_MS) continue;
+      g.connected = false;
+      changed = true;
+      if (this.host) {
+        if (g.seat > 0 && this.host.state.players[g.seat].kind === 'remote') {
+          this.host.setKind(g.seat, 'bot');
+          this.onToast(`${g.name} hot d'Verbindung verlore – a Bot spielt weiter.`);
+        }
+      } else {
+        this.guests = this.guests.filter((x) => x !== g);
+        this.reseat();
+        this.onToast(`${g.name} isch gange.`);
+      }
+    }
+    if (changed) this.publishLobby();
   }
 
   private reseat() {
-    this.guests = this.guests.filter((g) => g.conn.open || g.seat === -1);
     this.guests.forEach((g, i) => (g.seat = i + 1));
   }
 
@@ -153,80 +260,80 @@ export class OnlineHost {
       return;
     }
     this.mode = mode;
-    this.emitLobby();
+    this.publishLobby();
   }
 
   lobby(): LobbyInfo {
     return {
       code: this.code,
       mode: this.mode,
+      started: !!this.host,
       players: [
         { name: this.hostName, seat: 0, connected: true },
-        ...this.guests.map((g) => ({ name: g.name, seat: g.seat, connected: g.conn.open })),
+        ...this.guests.map((g) => ({ name: g.name, seat: g.seat, connected: g.connected })),
       ],
     };
   }
 
-  private emitLobby() {
+  private publishLobby() {
     const l = this.lobby();
     this.onLobby(l);
-    for (const g of this.guests) if (g.conn.open) g.conn.send({ t: 'lobby', lobby: l } satisfies Msg);
+    this.client?.publish(this.topic('lobby'), enc(l), { qos: 1, retain: true });
   }
 
   /** Startet das Spiel; freie Plätze übernehmen Bots. Gibt die Verbindung für den Gastgeber zurück. */
   startGame(): GameConn {
     const players: PlayerInfo[] = [];
-    const used = new Set<string>([this.hostName]);
-    const names = BOT_NAMES.filter((n) => !used.has(n));
+    const names = BOT_NAMES.filter((n) => n !== this.hostName && !this.guests.some((g) => g.name === n));
     for (let seat = 0; seat < this.mode; seat++) {
       if (seat === 0) players.push({ name: this.hostName, kind: 'local', level: this.level });
       else {
         const g = this.guests.find((x) => x.seat === seat);
-        if (g) players.push({ name: g.name, kind: 'remote', level: this.level });
+        if (g) players.push({ name: g.name, kind: g.connected ? 'remote' : 'bot', level: this.level });
         else players.push({ name: names.shift() ?? `Bot ${seat}`, kind: 'bot', level: this.level });
       }
     }
     this.host = HostController.create(this.mode, players);
+    this.lastViews.clear();
     for (const g of this.guests) {
-      this.guestSeats.add(g.seat);
-      g.conn.send({ t: 'start', seat: g.seat } satisfies Msg);
-      this.attachGuest(g.conn, g.seat);
+      this.send(g.id, { t: 'start', seat: g.seat });
+      const id = g.id;
+      const seat = g.seat;
+      this.host.addListener(
+        seat,
+        (view) => {
+          this.lastViews.set(seat, view);
+          this.send(id, { t: 'view', view });
+        },
+        (msg) => this.send(id, { t: 'error', msg }),
+      );
     }
     this.host.start();
+    this.publishLobby();
     return this.host.connFor(0);
-  }
-
-  private attachGuest(conn: DataConnection, seat: number) {
-    this.host!.addListener(
-      seat,
-      (view) => {
-        if (conn.open) conn.send({ t: 'view', view } satisfies Msg);
-      },
-      (msg) => {
-        if (conn.open) conn.send({ t: 'error', msg } satisfies Msg);
-      },
-    );
   }
 
   /** Nach Spielende: neue Partie mit denselben Leuten. */
   restart(): GameConn {
     this.host?.stop();
     this.host = null;
-    this.guests = this.guests.filter((g) => g.conn.open);
-    this.guestSeats.clear();
+    this.guests = this.guests.filter((g) => g.connected);
+    this.reseat();
     return this.startGame();
   }
 
   close() {
-    for (const g of this.guests) {
-      try {
-        if (g.conn.open) g.conn.send({ t: 'closed' } satisfies Msg);
-      } catch {
-        /* egal */
-      }
-    }
     this.host?.stop();
-    setTimeout(() => this.peer?.destroy(), 300);
+    if (this.timer) clearInterval(this.timer);
+    this.unwatch?.();
+    const c = this.client;
+    if (!c) return;
+    // Lobby als geschlossen markieren und Retain löschen
+    const closed: LobbyInfo = { ...this.lobby(), closed: true };
+    c.publish(this.topic('lobby'), enc(closed), { qos: 1 }, () => {
+      c.publish(this.topic('lobby'), '', { qos: 1, retain: true }, () => c.end());
+    });
+    setTimeout(() => c.end(true), 2000);
   }
 }
 
@@ -235,12 +342,15 @@ export class OnlineHost {
 // ---------------------------------------------------------------------------
 
 export class OnlineGuest {
-  private peer: Peer | null = null;
-  private conn: DataConnection | null = null;
+  private client: MqttClient | null = null;
+  private id = clientId();
   seat = -1;
   private viewCb: ((v: GameState) => void) | null = null;
   private errorCb: ((m: string) => void) | null = null;
   private lastView: GameState | null = null;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private unwatch: (() => void) | null = null;
+  private closed = false;
   onLobby: (l: LobbyInfo) => void = () => {};
   onStart: (conn: GameConn) => void = () => {};
   onError: (msg: string) => void = () => {};
@@ -249,59 +359,101 @@ export class OnlineGuest {
   constructor(
     private name: string,
     public code: string,
-  ) {}
+  ) {
+    this.code = code.toUpperCase();
+  }
 
-  connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const peer = new Peer();
-      this.peer = peer;
-      let done = false;
-      const fail = (msg: string) => {
-        if (!done) {
-          done = true;
-          reject(new Error(msg));
-        } else this.onError(msg);
+  private topic(s: string) {
+    return ROOT + this.code + '/' + s;
+  }
+
+  /** Sucht den Tisch auf den bekannten Servern. */
+  async connect(): Promise<void> {
+    for (const url of brokers()) {
+      let c: MqttClient;
+      try {
+        c = await connectTo(url);
+      } catch {
+        continue;
+      }
+      const lobby = await this.waitForLobby(c, 5000);
+      if (lobby && !lobby.closed) {
+        this.client = c;
+        this.attach(c);
+        this.onLobby(lobby);
+        return;
+      }
+      c.end(true);
+    }
+    throw new Error(`Tisch ${this.code} nicht gefunden. Stimmt der Code und ist der Gastgeber noch in der Lobby?`);
+  }
+
+  private waitForLobby(c: MqttClient, ms: number): Promise<LobbyInfo | null> {
+    return new Promise((resolve) => {
+      const t = this.topic('lobby');
+      const done = (l: LobbyInfo | null) => {
+        clearTimeout(timer);
+        c.removeListener('message', onMsg);
+        resolve(l);
       };
-      const timeout = setTimeout(() => fail('Zeitüberschreitung – Tisch nicht erreichbar.'), 15000);
-      peer.on('error', (e) => fail(friendlyError(e)));
-      peer.on('open', () => {
-        const conn = peer.connect(PREFIX + this.code.toUpperCase(), { reliable: true });
-        this.conn = conn;
-        conn.on('open', () => {
-          clearTimeout(timeout);
-          done = true;
-          conn.send({ t: 'hello', name: this.name } satisfies Msg);
-          resolve();
-        });
-        conn.on('data', (raw) => this.handle(raw as Msg));
-        conn.on('close', () => this.onClosed('Verbindung zum Tisch getrennt.'));
-        conn.on('error', () => this.onClosed('Verbindung zum Tisch getrennt.'));
-      });
+      const onMsg = (topic: string, payload: Uint8Array) => {
+        if (topic !== t) return;
+        const l = dec<LobbyInfo>(payload);
+        if (l) done(l);
+      };
+      const timer = setTimeout(() => done(null), ms);
+      c.on('message', onMsg);
+      c.subscribe(t, { qos: 1 });
     });
   }
 
-  private handle(msg: Msg) {
-    switch (msg.t) {
-      case 'lobby':
-        this.onLobby(msg.lobby);
-        break;
+  private attach(c: MqttClient) {
+    const lobbyTopic = this.topic('lobby');
+    const myTopic = this.topic('to/' + this.id);
+    c.on('message', (topic, payload) => {
+      if (topic === lobbyTopic) {
+        const l = dec<LobbyInfo>(payload);
+        if (!l) return;
+        if (l.closed) this.finish('Der Gastgeber hat den Tisch geschlossen.');
+        else this.onLobby(l);
+      } else if (topic === myTopic) {
+        const m = dec<Down>(payload);
+        if (m) this.handle(m);
+      }
+    });
+    c.subscribe(myTopic, { qos: 1 }, () => this.hello());
+    c.on('connect', () => this.hello()); // nach Wiederverbindung neu melden
+    this.pingTimer = setInterval(() => this.up({ t: 'ping', id: this.id, name: this.name }), PING_MS);
+    this.unwatch = watchVisibility(c, () => this.hello());
+  }
+
+  private hello() {
+    this.up({ t: 'hello', id: this.id, name: this.name });
+  }
+
+  private up(m: Up) {
+    if (this.client?.connected) this.client.publish(this.topic('up'), enc(m), { qos: 1 });
+  }
+
+  private handle(m: Down) {
+    switch (m.t) {
       case 'start':
-        this.seat = msg.seat;
-        this.lastView = null;
-        this.onStart(this.gameConn());
+        if (this.seat !== m.seat || !this.viewCb) {
+          this.seat = m.seat;
+          this.lastView = null;
+          this.viewCb = null;
+          this.onStart(this.gameConn());
+        }
         break;
       case 'view':
-        this.lastView = msg.view;
-        this.viewCb?.(msg.view);
+        this.lastView = m.view;
+        this.viewCb?.(m.view);
         break;
       case 'error':
-        this.errorCb?.(msg.msg);
+        this.errorCb?.(m.msg);
         break;
       case 'full':
-        this.onClosed('Der Tisch ist voll oder das Spiel läuft schon.');
-        break;
-      case 'closed':
-        this.onClosed('Der Gastgeber hat den Tisch geschlossen.');
+        this.finish('Der Tisch ist voll oder das Spiel läuft schon.');
         break;
     }
   }
@@ -313,13 +465,26 @@ export class OnlineGuest {
         this.viewCb = cb;
         if (this.lastView) cb(this.lastView);
       },
-      send: (a) => this.conn?.send({ t: 'action', a } satisfies Msg),
+      send: (a) => this.up({ t: 'action', id: this.id, a }),
       onError: (cb) => (this.errorCb = cb),
     };
   }
 
+  private finish(msg: string) {
+    if (this.closed) return;
+    this.close();
+    this.onClosed(msg);
+  }
+
   close() {
-    this.conn?.close();
-    setTimeout(() => this.peer?.destroy(), 300);
+    if (this.closed) return;
+    this.closed = true;
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.unwatch?.();
+    const c = this.client;
+    if (c) {
+      if (c.connected) c.publish(this.topic('up'), enc({ t: 'bye', id: this.id }), { qos: 0 });
+      setTimeout(() => c.end(true), 300);
+    }
   }
 }

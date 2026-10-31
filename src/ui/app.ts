@@ -1,6 +1,6 @@
 import { Level, PlayerInfo } from '../engine/game';
 import { GameConn, HostController } from '../controller/host';
-import { LobbyInfo, OnlineGuest, OnlineHost } from '../net/online';
+import type { LobbyInfo, OnlineGuest, OnlineHost } from '../net/online';
 import { suitSvg } from './cardsvg';
 import { BOT_NAMES } from './phrases';
 import { RULES_HTML } from './rules';
@@ -24,9 +24,12 @@ export class App {
   private rulesOpen = false;
 
   constructor(private root: HTMLElement) {
-    const join = new URLSearchParams(location.search).get('join');
+    const params = new URLSearchParams(location.search);
+    const join = params.get('join');
     if (join) {
-      history.replaceState(null, '', location.pathname);
+      params.delete('join');
+      const rest = params.toString();
+      history.replaceState(null, '', location.pathname + (rest ? '?' + rest : ''));
       this.showMenu(join.toUpperCase());
     } else this.showMenu();
   }
@@ -84,6 +87,7 @@ export class App {
 
         <section class="card-box">
           <h2>Online mit Freind</h2>
+          ${this.lastTable() ? `<button class="btn primary wide" id="rejoin">Zurück an Tisch ${esc(this.lastTable()!)}</button>` : ''}
           <button class="btn secondary wide" id="create">Tisch aufmacha</button>
           <div class="join-row">
             <input id="code" maxlength="4" placeholder="CODE" value="${esc(joinCode)}" autocomplete="off" autocapitalize="characters">
@@ -114,6 +118,7 @@ export class App {
     this.root.querySelector('#offline')!.addEventListener('click', () => this.startOffline());
     this.root.querySelector('#resume')?.addEventListener('click', () => this.resumeOffline());
     this.root.querySelector('#create')!.addEventListener('click', () => this.createTable());
+    this.root.querySelector('#rejoin')?.addEventListener('click', () => this.joinTable(this.lastTable()!));
     this.root.querySelector('#join')!.addEventListener('click', () => {
       const code = this.root.querySelector<HTMLInputElement>('#code')!.value.trim().toUpperCase();
       if (code.length !== 4) {
@@ -203,7 +208,8 @@ export class App {
   private async createTable() {
     this.cleanup();
     this.renderConnecting('Tisch wird aufgmacht…');
-    for (let attempt = 0; attempt < 3; attempt++) {
+    const { OnlineHost } = await import('../net/online');
+    for (let attempt = 0; attempt < 1; attempt++) {
       const oh = new OnlineHost(this.playerName());
       oh.mode = this.settings.mode;
       oh.level = this.settings.level;
@@ -217,10 +223,8 @@ export class App {
       } catch (e) {
         oh.close();
         this.onlineHost = null;
-        if (attempt === 2 || !(e as Error).message.includes('vergeben')) {
-          this.renderError((e as Error).message);
-          return;
-        }
+        this.renderError((e as Error).message);
+        return;
       }
     }
   }
@@ -316,6 +320,7 @@ export class App {
   private async joinTable(code: string) {
     this.cleanup();
     this.renderConnecting(`Verbinde mit Tisch ${code}…`);
+    const { OnlineGuest } = await import('../net/online');
     const g = new OnlineGuest(this.playerName(), code);
     this.guest = g;
     g.onLobby = (l) => this.renderGuestLobby(l);
@@ -329,6 +334,7 @@ export class App {
     };
     try {
       await g.connect();
+      save('binokel-last-table', { code, time: Date.now() });
     } catch (e) {
       if (this.guest === g) {
         g.close();
@@ -336,6 +342,12 @@ export class App {
         this.renderError((e as Error).message);
       }
     }
+  }
+
+  /** Zuletzt besuchter Tisch (für schnellen Wiedereinstieg, 3 Stunden gültig). */
+  private lastTable(): string | null {
+    const t = load<{ code: string; time: number }>('binokel-last-table', { code: '', time: 0 });
+    return t.code && Date.now() - t.time < 3 * 3600 * 1000 ? t.code : null;
   }
 
   private renderGuestLobby(l: LobbyInfo) {

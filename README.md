@@ -3,7 +3,7 @@
 Klassisches schwäbisches Binokel als Web-App (PWA) fürs Handy – mit deutschem Blatt, Tisch-Ansicht und schwäbischen Sprüchen.
 
 - **Gegen den Computer:** 3 Spieler oder Kreuzbinokel (4 Spieler, 2 gegen 2), KI in *Normal* oder *Schwer*
-- **Online mit Freunden:** Tisch aufmachen, 4-stelligen Code oder Link teilen – Verbindung direkt von Handy zu Handy (WebRTC/PeerJS), freie Plätze übernehmen Bots
+- **Online mit Freunden:** Tisch aufmachen, 4-stelligen Code oder Link teilen – Verbindung über einen öffentlichen Spielserver (MQTT über WebSocket), funktioniert in jedem Netz; freie Plätze und Verbindungsabbrüche übernehmen Bots, Wiedereinstieg jederzeit
 - **Offline spielbar** und als App installierbar („Zum Home-Bildschirm“)
 
 ## Installieren aufs Handy
@@ -25,7 +25,7 @@ Struktur:
 - `src/engine/` – Karten, Meldungen, Stichregeln, Spielablauf (rein, ohne UI)
 - `src/ai/` – Computer-Gegner (Normal: Heuristik, Schwer: Kartenzählen + Monte-Carlo-Simulation)
 - `src/controller/` – Spielleitung (Host), steuert Bots und verteilt die Sicht je Platz
-- `src/net/` – Online-Modus über PeerJS
+- `src/net/` – Online-Modus über MQTT (HiveMQ, Ausweich: EMQX); zum Testen `?broker=ws://localhost:8888`
 - `src/ui/` – Tisch, Menü, Regeln
 
 ## Veröffentlichung
