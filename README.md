@@ -32,3 +32,14 @@ Struktur:
 
 Jeder Push wird per GitHub Actions gebaut und auf GitHub Pages veröffentlicht
 (einmalig nötig: *Settings → Pages → Source: GitHub Actions*).
+
+## Echte Kartenbilder einsetzen
+
+Liegen Bilddateien in `src/assets/cards/`, werden sie automatisch statt der gezeichneten Karten verwendet.
+Dateiname: `<Farbe>-<Rang>.<jpg|png|webp|svg>`
+
+- Farbe: `E` Eichel, `L` Laub, `H` Herz, `S` Schellen
+- Rang: `A` Sau, `Z` Zehner, `K` König, `O` Ober, `U` Unter, `7` Siebener (nur Kreuzbinokel)
+- Rückseite: `back.jpg`
+
+Beispiel: `H-A.jpg`, `S-U.png`, `E-7.webp`. Hochformat, Seitenverhältnis etwa 1 : 1,55.
